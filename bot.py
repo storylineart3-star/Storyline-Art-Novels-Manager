@@ -4,6 +4,8 @@ import os
 import re
 import shlex
 import sqlite3
+import csv
+import io
 from datetime import datetime
 from typing import Optional, List, Tuple, Dict, Any
 from urllib.parse import urljoin
@@ -43,8 +45,8 @@ STORAGE_GROUP_ID = int(os.environ.get("STORAGE_GROUP_ID")) if os.environ.get("ST
 MONGO_URI = os.environ.get("MONGO_URI")
 DB_PATH = "novels.db"
 
-# Conversation states
-(NAME, AUTHOR, PLATFORM, CHANNEL, STORY_NAME, IMAGE) = range(6)
+# Conversation states (Reordered per request)
+(NAME, AUTHOR, IMAGE, PLATFORM, CHANNEL, STORY_NAME) = range(6)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -52,7 +54,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ----------------------------------------------------------------------
-# Database abstraction layer (MongoDB primary, SQLite fallback)
+# Database abstraction layer
 # ----------------------------------------------------------------------
 class Database:
     def __init__(self):
@@ -395,21 +397,23 @@ class Database:
         conn.close()
 
 db = Database()
-
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
 def extract_author(full_caption: str) -> Tuple[str, Optional[str]]:
+    if not full_caption:
+        return "", None
+    first_line = full_caption.strip().split('\n')[0]
+    # Catches: Title by Author, Title written by Author, Title - Author, Title (Author)
     patterns = [
-        r'^(.*?)\s+[bB][yY]\s+(.+)$',
-        r'^(.*?)\s+-\s+(.+)$',
+        r'^(.*?)\s+(?:written\s+by|by|-)\s+(.+)$',
         r'^(.*?)\s+\((.+)\)$',
     ]
     for pat in patterns:
-        match = re.match(pat, full_caption.strip())
+        match = re.match(pat, first_line, re.IGNORECASE)
         if match:
             return match.group(1).strip(), match.group(2).strip()
-    return full_caption.strip(), None
+    return first_line.strip(), None
 
 def normalize(name: str) -> str:
     return name.strip().lower()
@@ -445,8 +449,23 @@ async def forward_to_storage(context: ContextTypes.DEFAULT_TYPE, chat_id: int, m
         logger.error(f"Failed to forward to storage: {e}")
         return None, None
 
+async def send_rich_duplicate_check(context: ContextTypes.DEFAULT_TYPE, chat_id: int, p: dict, msg_id_suffix: str):
+    text = f"📚 *Title:* {escape_mdv2(p['original_name'])}\n"
+    text += f"👤 *Author:* {escape_mdv2(p.get('author') or 'Unknown')}\n"
+    text += f"🌐 *Platform:* {escape_mdv2(p.get('platform') or 'Unknown')}"
+    
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Yes (same)", callback_data=f"same_{p['id']}_{msg_id_suffix}"),
+        InlineKeyboardButton("❌ No", callback_data=f"diff_{p['id']}_{msg_id_suffix}")
+    ]])
+    
+    if p.get('file_id'):
+        await context.bot.send_photo(chat_id=chat_id, photo=p['file_id'], caption=text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=keyboard)
+    else:
+        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=keyboard)
+
 # ----------------------------------------------------------------------
-# Group automatic detection (with image storage)
+# Group automatic detection
 # ----------------------------------------------------------------------
 async def handle_group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.photo:
@@ -492,24 +511,16 @@ async def handle_group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if partials:
         try:
             await context.bot.send_message(chat_id=sender_id,
-                                           text="🔎 Similar novels found. I’ll send you the originals one by one.\n"
-                                                "Please tell me if any of them is the same.")
+                                           text="🔎 Similar novels found. Please check if any of these match what you just posted:")
             for p in partials:
-                fwd_chat_id = p.get('storage_chat_id') or p.get('chat_id')
-                fwd_msg_id = p.get('storage_message_id') or p.get('message_id')
-                if fwd_chat_id and fwd_msg_id:
-                    await context.bot.forward_message(chat_id=sender_id, from_chat_id=fwd_chat_id, message_id=fwd_msg_id)
-                keyboard = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("✅ Yes (same)", callback_data=f"same_{p['id']}_{message_id}"),
-                    InlineKeyboardButton("❌ No", callback_data=f"diff_{p['id']}_{message_id}")
-                ]])
-                await context.bot.send_message(chat_id=sender_id, text="Is this the same novel?", reply_markup=keyboard)
-            await update.message.reply_text("🔍 I found similar novels. I’ve DMed you the details.",
+                await send_rich_duplicate_check(context, sender_id, p, str(message_id))
+            await update.message.reply_text("🔍 I found similar novels. I’ve DMed you the details to confirm.",
                                             reply_to_message_id=message_id)
         except Exception as e:
             logger.warning(f"Could not DM user {sender_id}: {e}")
             await update.message.reply_text("⚠️ Please start a private chat with me so I can DM you about similar novels.",
                                             reply_to_message_id=message_id)
+        
         storage_chat_id, storage_msg_id = await forward_to_storage(context, chat_id, message_id)
         await db.add_novel(norm_name, novel_name, author, None, None, None,
                            file_id, chat_id, message_id, storage_chat_id, storage_msg_id,
@@ -520,10 +531,14 @@ async def handle_group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await db.add_novel(norm_name, novel_name, author, None, None, None,
                        file_id, chat_id, message_id, storage_chat_id, storage_msg_id,
                        sender_id, sender_name)
-    await update.message.reply_text("✅ Novel saved. No repost detected.", reply_to_message_id=message_id)
+    try:
+        await update.message.set_reaction(reaction="👍")
+    except Exception:
+        pass
+    await update.message.reply_text("✅ Novel saved. No repost detected.", reply_to_message_id=message_id, disable_notification=True)
 
 # ----------------------------------------------------------------------
-# Duplicate confirmation callback (group + manual)
+# Duplicate confirmation callback
 # ----------------------------------------------------------------------
 async def button_same_diff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -542,10 +557,10 @@ async def button_same_diff(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_manual:
             pending = context.user_data.get("pending_add")
             if pending:
-                await query.edit_message_text(f"❌ Duplicate confirmed. The novel '{escape_mdv2(pending['original_name'])}' will NOT be added.")
+                await query.edit_message_caption(f"❌ Duplicate confirmed. The novel '{escape_mdv2(pending['original_name'])}' will NOT be added.") if query.message.photo else await query.edit_message_text(f"❌ Duplicate confirmed. The novel '{escape_mdv2(pending['original_name'])}' will NOT be added.")
                 context.user_data.pop("pending_add", None)
             else:
-                await query.edit_message_text("❌ Duplicate confirmed.")
+                await query.edit_message_caption("❌ Duplicate confirmed.") if query.message.photo else await query.edit_message_text("❌ Duplicate confirmed.")
         else:
             exact = await db.get_exact_match(novel_id) if not novel_id.isdigit() else None
             if exact:
@@ -557,7 +572,7 @@ async def button_same_diff(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode=ParseMode.MARKDOWN_V2,
                     reply_to_message_id=int(suffix) if suffix.isdigit() else None
                 )
-            await query.edit_message_text("✅ Marked as duplicate. Warning sent to group.")
+            await query.edit_message_caption("✅ Marked as duplicate. Warning sent to group.") if query.message.photo else await query.edit_message_text("✅ Marked as duplicate. Warning sent to group.")
     else:  # diff
         if is_manual:
             pending = context.user_data.get("pending_add")
@@ -572,23 +587,21 @@ async def button_same_diff(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         pending.get("storage_chat_id"), pending.get("storage_message_id"),
                         pending["sender_id"], pending["sender_name"]
                     )
-                    await query.edit_message_text(
-                        f"✅ Novel added!\n"
-                        f"• Name: {escape_mdv2(pending['original_name'])}\n"
-                        f"• Author: {escape_mdv2(pending['author'] or '—')}\n"
-                        f"• Platform: {escape_mdv2(pending['platform'] or '—')}\n"
-                        f"• Channel: {escape_mdv2(pending['channel'] or '—')}\n"
-                        f"• Story: {escape_mdv2(pending['story_name'] or '—')}\n"
-                        f"• Date: {datetime.utcnow().strftime('%Y-%m-%d')}",
-                        parse_mode=ParseMode.MARKDOWN_V2
-                    )
+                    success_msg = (f"✅ Novel added!\n"
+                                   f"• Name: {escape_mdv2(pending['original_name'])}\n"
+                                   f"• Author: {escape_mdv2(pending['author'] or '—')}\n"
+                                   f"• Platform: {escape_mdv2(pending['platform'] or '—')}\n"
+                                   f"• Channel: {escape_mdv2(pending['channel'] or '—')}\n"
+                                   f"• Story: {escape_mdv2(pending['story_name'] or '—')}\n"
+                                   f"• Date: {datetime.utcnow().strftime('%Y-%m-%d')}")
+                    await query.edit_message_caption(success_msg, parse_mode=ParseMode.MARKDOWN_V2) if query.message.photo else await query.edit_message_text(success_msg, parse_mode=ParseMode.MARKDOWN_V2)
                     context.user_data.pop("pending_add", None)
                 else:
-                    await query.edit_message_text("✅ Noted – not the same. Waiting for other confirmations...")
+                    await query.edit_message_caption("✅ Noted – not the same. Waiting for other confirmations...") if query.message.photo else await query.edit_message_text("✅ Noted – not the same. Waiting for other confirmations...")
             else:
-                await query.edit_message_text("✅ Noted – this is a different novel.")
+                await query.edit_message_caption("✅ Noted – this is a different novel.") if query.message.photo else await query.edit_message_text("✅ Noted – this is a different novel.")
         else:
-            await query.edit_message_text("✅ Noted – this is a different novel.")
+            await query.edit_message_caption("✅ Noted – this is a different novel.") if query.message.photo else await query.edit_message_text("✅ Noted – this is a different novel.")
 
 # ----------------------------------------------------------------------
 # Private chat – start & help
@@ -599,106 +612,150 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔍 Search", callback_data="search_menu")],
         [InlineKeyboardButton("❓ Help", callback_data="help_menu")],
     ])
-    await update.message.reply_text("Welcome! Choose an option below:", reply_markup=keyboard)
+    await update.message.reply_text("Welcome to Storyline Art Novels Manager! Choose an option below:", reply_markup=keyboard)
 
 async def help_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     msg = (
-        "📚 *Novel Repost Guard*\n\n"
+        "📚 *Storyline Art Novels Manager*\n\n"
         "*Group:* Post a photo with the novel name. Bot checks for duplicates.\n"
         "*Private chat:* Use buttons to add novels or search.\n\n"
         "Admins: /admin for control panel.\n"
         "Super admin: /promote & /demote.\n"
-        "Indexing: /index & /stopindex."
+        "Indexing: /index & /stopindex.\n\n"
+        "Need Support? Contact: @GamingHommie"
     )
-    await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="start_menu")]])
+    await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=keyboard)
 
-# ----------------------------------------------------------------------
-# Manual add conversation (with story name)
+async def start_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add Novel", callback_data="add_novel")],
+        [InlineKeyboardButton("🔍 Search", callback_data="search_menu")],
+        [InlineKeyboardButton("❓ Help", callback_data="help_menu")],
+    ])
+    await query.edit_message_text("Welcome to Storyline Art Novels Manager! Choose an option below:", reply_markup=keyboard)
+
+    # ----------------------------------------------------------------------
+# Manual Add Conversation Flow
 # ----------------------------------------------------------------------
 async def add_novel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("📖 Send me the *novel name*:", parse_mode=ParseMode.MARKDOWN_V2)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_add")]])
+    await query.edit_message_text("📖 Please send me the *Novel Name*:", parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
     return NAME
 
 async def add_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["novel_name"] = update.message.text
-    await update.message.reply_text("✍️ Now send the *author name* (or /skip):", parse_mode=ParseMode.MARKDOWN_V2)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏭ Skip", callback_data="skip_author")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_add")]
+    ])
+    await update.message.reply_text("✍️ Great! Now send the *Author Name*:", parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
     return AUTHOR
 
-async def add_author(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text.lower() != "/skip":
-        context.user_data["author"] = update.message.text
-    else:
-        context.user_data["author"] = None
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Pratilipi", callback_data="plat_Pratilipi")],
-        [InlineKeyboardButton("Pocket Novel", callback_data="plat_Pocket Novel")],
-        [InlineKeyboardButton("Other", callback_data="plat_Other")],
-        [InlineKeyboardButton("Skip", callback_data="plat_Skip")],
+async def process_author(update: Update, context: ContextTypes.DEFAULT_TYPE, author_val: Optional[str]):
+    context.user_data["author"] = author_val
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏭ Skip Image", callback_data="skip_image")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_add")]
     ])
-    await update.message.reply_text("🌐 Choose *platform*:", reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN_V2)
+    msg = update.message or update.callback_query.message
+    await msg.reply_text("🖼️ Now send a *Photo* for the novel:", parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
+    return IMAGE
+
+async def add_author_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await process_author(update, context, update.message.text)
+
+async def skip_author_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    return await process_author(update, context, None)
+
+async def process_image(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id, chat_id, msg_id):
+    context.user_data["file_id"] = file_id
+    context.user_data["image_chat_id"] = chat_id
+    context.user_data["image_message_id"] = msg_id
+    
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Pratilipi", callback_data="plat_Pratilipi"), InlineKeyboardButton("Pocket Novel", callback_data="plat_Pocket Novel")],
+        [InlineKeyboardButton("Webnovel", callback_data="plat_Webnovel"), InlineKeyboardButton("Other", callback_data="plat_Other")],
+        [InlineKeyboardButton("⏭ Skip", callback_data="plat_Skip")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_add")]
+    ])
+    msg = update.message or update.callback_query.message
+    await msg.reply_text("🌐 Choose the *Platform*:", reply_markup=kb, parse_mode=ParseMode.MARKDOWN_V2)
     return PLATFORM
+
+async def add_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    photo = update.message.photo[-1]
+    return await process_image(update, context, photo.file_id, update.message.chat_id, update.message.message_id)
+
+async def skip_image_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    return await process_image(update, context, None, None, None)
 
 async def add_platform_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     plat = query.data.split("_", 1)[1]
     context.user_data["platform"] = plat if plat != "Skip" else None
-    await query.edit_message_text("📺 Now send the *channel name* (YouTube):", parse_mode=ParseMode.MARKDOWN_V2)
+    
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏭ Skip", callback_data="skip_channel")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_add")]
+    ])
+    await query.edit_message_text("📺 Send the *YouTube Channel Name*:", parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
     return CHANNEL
 
-async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["channel"] = update.message.text.strip()
-    await update.message.reply_text("📝 Now send the *story name on that channel* (or /skip):", parse_mode=ParseMode.MARKDOWN_V2)
+async def process_channel(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_val: Optional[str]):
+    context.user_data["channel"] = channel_val
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏭ Skip", callback_data="skip_story")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_add")]
+    ])
+    msg = update.message or update.callback_query.message
+    await msg.reply_text("📝 Finally, send the *Story Name* on that channel:", parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
     return STORY_NAME
 
-async def add_story_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text.lower() != "/skip":
-        context.user_data["story_name"] = update.message.text.strip()
-    else:
-        context.user_data["story_name"] = None
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⏭ Skip", callback_data="skip_image"),
-         InlineKeyboardButton("❌ Cancel", callback_data="cancel_add")]
-    ])
-    await update.message.reply_text("🖼️ Send a *photo*, or use the buttons below:", reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN_V2)
-    return IMAGE
+async def add_channel_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await process_channel(update, context, update.message.text.strip())
 
-async def add_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    photo = update.message.photo[-1]
-    context.user_data["file_id"] = photo.file_id
-    context.user_data["image_chat_id"] = update.message.chat_id
-    context.user_data["image_message_id"] = update.message.message_id
-    await update.message.reply_text("✅ Photo saved. Checking for duplicates...")
-    return await finalize_add(update, context)
+async def skip_channel_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    return await process_channel(update, context, None)
 
-async def add_image_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    context.user_data["file_id"] = None
-    context.user_data["image_chat_id"] = None
-    context.user_data["image_message_id"] = None
-    await query.edit_message_text("Skipped photo. Checking for duplicates...")
-    return await finalize_add(update, context)
+async def process_story(update: Update, context: ContextTypes.DEFAULT_TYPE, story_val: Optional[str]):
+    context.user_data["story_name"] = story_val
+    msg = update.message or update.callback_query.message
+    await msg.reply_text("🔍 Checking for duplicates...")
+    return await finalize_add(update, context, msg)
+
+async def add_story_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await process_story(update, context, update.message.text.strip())
+
+async def skip_story_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    return await process_story(update, context, None)
 
 async def cancel_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         query = update.callback_query
         await query.answer()
-        await query.edit_message_text("❌ Add cancelled.")
+        await query.edit_message_text("❌ Adding process cancelled.")
     else:
-        await update.message.reply_text("❌ Add cancelled.", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text("❌ Adding process cancelled.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
-async def finalize_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def finalize_add(update: Update, context: ContextTypes.DEFAULT_TYPE, msg_obj):
     user_data = context.user_data
     name = user_data["novel_name"]
     author = user_data.get("author")
     platform = user_data.get("platform")
-    channel = user_data["channel"]
+    channel = user_data.get("channel")
     story_name = user_data.get("story_name")
     file_id = user_data.get("file_id")
     norm_name = normalize(name)
@@ -706,7 +763,7 @@ async def finalize_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sender_name = sender.full_name
     sender_id = sender.id
     chat_id = update.effective_chat.id
-    message_id = update.effective_message.message_id
+    message_id = msg_obj.message_id
 
     storage_chat_id, storage_msg_id = None, None
     if user_data.get("image_chat_id") and user_data.get("image_message_id"):
@@ -718,7 +775,7 @@ async def finalize_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if exact:
         orig_name_esc = escape_mdv2(exact['original_name'])
         sender_esc = escape_mdv2(exact['sender_name'])
-        await update.effective_message.reply_text(
+        await msg_obj.reply_text(
             f"❌ This novel *already exists* in the database!\n"
             f"Name: {orig_name_esc}\nAdded by: {sender_esc} on {exact['date'][:10]}",
             parse_mode=ParseMode.MARKDOWN_V2
@@ -735,26 +792,13 @@ async def finalize_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     partials = await db.get_partial_matches(words)
     if partials:
         for p in partials:
-            try:
-                fwd_chat_id = p.get('storage_chat_id') or p.get('chat_id')
-                fwd_msg_id = p.get('storage_message_id') or p.get('message_id')
-                if fwd_chat_id and fwd_msg_id:
-                    await context.bot.forward_message(chat_id=chat_id, from_chat_id=fwd_chat_id, message_id=fwd_msg_id)
-                else:
-                    await context.bot.send_message(chat_id=chat_id,
-                                                   text=f"Similar novel (ID {p['id']}): {escape_mdv2(p['original_name'])} (no image)")
-            except:
-                pass
-            keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Yes (same)", callback_data=f"same_{p['id']}_manual"),
-                InlineKeyboardButton("❌ No", callback_data=f"diff_{p['id']}_manual")
-            ]])
-            await context.bot.send_message(chat_id=chat_id, text="Is this the same novel?", reply_markup=keyboard)
-        await update.effective_message.reply_text(
-            "🔎 I found similar novels above. Please use the buttons to confirm if any are the same.\n"
-            "If you click *No* for all, the novel will be added automatically after the last confirmation.\n"
-            "You can also /cancel to abort.",
-            parse_mode=ParseMode.MARKDOWN_V2
+            await send_rich_duplicate_check(context, chat_id, p, "manual")
+            
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Add", callback_data="cancel_add")]])
+        await msg_obj.reply_text(
+            "🔎 I found similar novels above. Please confirm if any are the same.\n"
+            "If you click *No* for all, the novel will be added automatically.",
+            parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb
         )
         context.user_data["pending_add"] = {
             "norm_name": norm_name,
@@ -777,7 +821,7 @@ async def finalize_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await db.add_novel(norm_name, name, author, platform, channel, story_name,
                        file_id, chat_id, message_id, storage_chat_id, storage_msg_id,
                        sender_id, sender_name)
-    await update.effective_message.reply_text(
+    await msg_obj.reply_text(
         f"✅ Novel added!\n"
         f"• Name: {escape_mdv2(name)}\n"
         f"• Author: {escape_mdv2(author or '—')}\n"
@@ -790,17 +834,56 @@ async def finalize_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ----------------------------------------------------------------------
-# Search (admins see channel/story; normal users don't)
+# Central Private Message Router & Search/Filter functions
 # ----------------------------------------------------------------------
+async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ud = context.user_data
+    msg = update.message
+
+    # --- 1. Index Mode Routing ---
+    if ud.get("index_mode"):
+        pending = ud.get("pending_index")
+        if msg.photo:
+            caption = msg.caption or ""
+            first_line = caption.split('\n')[0] if caption else ""
+            if first_line:
+                await process_indexed_novel(update, context, first_line, msg)
+            else:
+                if pending and pending["type"] == "text":
+                    await process_indexed_novel(update, context, pending["caption"], msg)
+                    ud["pending_index"] = None
+                else:
+                    ud["pending_index"] = {"type": "photo", "message": msg}
+                    await msg.reply_text("📸 Photo received! Now type or forward the novel name.")
+            return
+        elif msg.text:
+            if pending and pending["type"] == "photo":
+                await process_indexed_novel(update, context, msg.text, pending["message"])
+                ud["pending_index"] = None
+            else:
+                ud["pending_index"] = {"type": "text", "caption": msg.text}
+                await msg.reply_text("📝 Novel name noted! Now forward the photo.")
+            return
+
+    # --- 2. Standard State Routing ---
+    if not msg.text:
+        return
+
+    if ud.get("awaiting_search"):
+        await handle_search_text(update, context)
+    elif ud.get("awaiting_filter"):
+        await handle_filter_text(update, context)
+    elif ud.get("awaiting_delete_id"):
+        await handle_delete_id(update, context)
+
 async def search_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("🔎 Send me a search query (novel name, author, or channel):")
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="start_menu")]])
+    await query.edit_message_text("🔎 Send me a search query (novel name, author, or channel):", reply_markup=kb)
     context.user_data["awaiting_search"] = True
 
 async def handle_search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("awaiting_search"):
-        return
     query_text = update.message.text.strip()
     context.user_data["search_query"] = query_text
     context.user_data["search_offset"] = 0
@@ -854,16 +937,22 @@ async def search_page_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 # Admin panel & listing
 # ----------------------------------------------------------------------
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Admin only.")
+    user_id = update.effective_user.id
+    if not await is_admin(user_id):
+        if update.message: await update.message.reply_text("⛔ Admin only.")
         return
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📋 List novels", callback_data="admin_list")],
         [InlineKeyboardButton("📊 Stats", callback_data="admin_stats")],
         [InlineKeyboardButton("🔍 Filtered search", callback_data="admin_filter")],
         [InlineKeyboardButton("🗑 Delete (by ID)", callback_data="admin_delete_prompt")],
+        [InlineKeyboardButton("🔙 Close Admin", callback_data="start_menu")]
     ])
-    await update.message.reply_text("🔧 Admin Panel:", reply_markup=keyboard)
+    text = "🔧 Admin Panel:\n(Pro tip: Type /export to download a database CSV)"
+    if update.message:
+        await update.message.reply_text(text, reply_markup=keyboard)
+    else:
+        await update.callback_query.edit_message_text(text, reply_markup=keyboard)
 
 async def admin_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -882,7 +971,7 @@ async def show_admin_list(update: Update, context):
         offset=offset, limit=5
     )
     if not novels:
-        await update.callback_query.edit_message_text("No novels found.")
+        await update.callback_query.edit_message_text("No novels found.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin")]]))
         return
     text = f"📋 Novels (filtered) – page {offset//5 + 1}\n\n"
     for n in novels:
@@ -906,8 +995,9 @@ async def show_admin_list(update: Update, context):
         buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"admin_list_page_{current_page-1}"))
     if current_page < total_pages - 1:
         buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"admin_list_page_{current_page+1}"))
-    buttons.append(InlineKeyboardButton("🔧 Set filter", callback_data="admin_filter"))
-    await update.callback_query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=InlineKeyboardMarkup([buttons]))
+    
+    keyboard = [[InlineKeyboardButton("🔧 Set filter", callback_data="admin_filter")], buttons, [InlineKeyboardButton("🔙 Back", callback_data="admin")]]
+    await update.callback_query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def admin_list_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -919,17 +1009,16 @@ async def admin_list_page_callback(update: Update, context: ContextTypes.DEFAULT
 async def admin_filter_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="admin")]])
     await query.edit_message_text(
         "Send filter in format:\n`author:Name`\n`platform:Pratilipi`\n`channel:Channel`\n"
         "Combine with spaces (e.g. `author:John platform:Pratilipi`)\n"
-        "Or /skip to clear all filters.",
-        parse_mode=ParseMode.MARKDOWN_V2
+        "Or type /skip to clear all filters.",
+        parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb
     )
     context.user_data["awaiting_filter"] = True
 
 async def handle_filter_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("awaiting_filter"):
-        return
     text = update.message.text.strip()
     if text.lower() == "/skip":
         context.user_data["admin_list_filters"] = {}
@@ -949,6 +1038,11 @@ async def handle_filter_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data["admin_list_offset"] = 0
     context.user_data["awaiting_filter"] = False
     await update.message.reply_text("Filters applied. Showing list:")
+    # We trigger the list view manually since we don't have a callback query here
+    class FakeQuery:
+         async def edit_message_text(self, *args, **kwargs):
+             await update.message.reply_text(*args, **kwargs)
+    update.callback_query = FakeQuery()
     await show_admin_list(update, context)
 
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -956,21 +1050,22 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     s = await db.get_stats()
     text = f"📊 *Statistics*\nTotal novels: {s['total']}\nDistinct authors: {s['authors']}\nPlatforms used: {s['platforms']}\nChannels: {s['channels']}"
-    await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin")]])
+    await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
 
 async def admin_delete_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("Send the ID of the novel to delete:")
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="admin")]])
+    await query.edit_message_text("Send the ID of the novel to delete:", reply_markup=kb)
     context.user_data["awaiting_delete_id"] = True
 
 async def handle_delete_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("awaiting_delete_id"):
-        return
     novel_id = update.message.text.strip()
     await db.delete_novel(novel_id)
     await update.message.reply_text(f"✅ Novel {novel_id} deleted.")
     context.user_data["awaiting_delete_id"] = False
+    await admin_panel(update, context)
 
 # ----------------------------------------------------------------------
 # Indexing (accepts any forwarded message)
@@ -992,38 +1087,6 @@ async def stop_index(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("pending_index", None)
     msg = f"Index mode OFF. {count} novel(s) added." if count else "Index mode OFF. No novels were added."
     await update.message.reply_text(msg)
-
-async def handle_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("index_mode", False):
-        return
-    msg = update.message
-    # Accept any forwarded message, no origin check
-    if not msg.forward_origin:
-        await msg.reply_text("Please forward messages.")
-        return
-
-    pending = context.user_data.get("pending_index")
-
-    if msg.photo:
-        caption = msg.caption
-        if caption:
-            await process_indexed_novel(update, context, caption, msg)
-        else:
-            if pending and pending["type"] == "text":
-                await process_indexed_novel(update, context, pending["caption"], msg)
-                context.user_data["pending_index"] = None
-            else:
-                context.user_data["pending_index"] = {"type": "photo", "message": msg}
-                await msg.reply_text("Photo received. Waiting for the novel name (text).")
-    elif msg.text:
-        if pending and pending["type"] == "photo":
-            await process_indexed_novel(update, context, msg.text, pending["message"])
-            context.user_data["pending_index"] = None
-        else:
-            context.user_data["pending_index"] = {"type": "text", "caption": msg.text}
-            await msg.reply_text("Novel name noted. Now forward the photo.")
-    else:
-        await msg.reply_text("Unsupported message type. Please forward a photo or text.")
 
 async def process_indexed_novel(update: Update, context, caption_text: str, photo_msg):
     novel_name, author = extract_author(caption_text)
@@ -1054,7 +1117,47 @@ async def process_indexed_novel(update: Update, context, caption_text: str, phot
     await update.message.reply_text(f"✅ Indexed: {escape_mdv2(novel_name)}", parse_mode=ParseMode.MARKDOWN_V2)
 
 # ----------------------------------------------------------------------
-# Admin promotion / demotion (super admin only)
+# Export Database Feature (CSV)
+# ----------------------------------------------------------------------
+async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id):
+        return
+    await update.message.reply_text("⏳ Generating database export...")
+
+    if db.fallback:
+        conn = sqlite3.connect(db.sqlite_path)
+        c = conn.cursor()
+        c.execute("SELECT * FROM novels ORDER BY date DESC")
+        rows = c.fetchall()
+        cols = [col[0] for col in c.description]
+        novels = [dict(zip(cols, row)) for row in rows]
+        conn.close()
+    else:
+        cursor = db.db.novels.find({}).sort("date", -1)
+        novels = []
+        async for doc in cursor:
+            doc["id"] = str(doc["_id"])
+            novels.append(doc)
+
+    if not novels:
+        await update.message.reply_text("Database is empty.")
+        return
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    keys = ["id", "original_name", "author", "platform", "channel", "story_name", "date", "sender_name"]
+    writer.writerow(keys)
+    for n in novels:
+        writer.writerow([n.get(k, "") for k in keys])
+
+    output.seek(0)
+    bio = io.BytesIO(output.read().encode('utf-8'))
+    bio.name = f"novels_export_{datetime.utcnow().strftime('%Y%m%d')}.csv"
+
+    await update.message.reply_document(document=bio, caption="📊 Here is your database backup.")
+
+# ----------------------------------------------------------------------
+# Admin promotion / demotion / broadcast
 # ----------------------------------------------------------------------
 async def promote_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_super_admin(update.effective_user.id):
@@ -1089,9 +1192,6 @@ async def demote_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await db.remove_admin(user_id)
     await update.message.reply_text(f"✅ User {user_id} is no longer an admin.")
 
-# ----------------------------------------------------------------------
-# Broadcast (admin only)
-# ----------------------------------------------------------------------
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.effective_user.id):
         return
@@ -1130,42 +1230,55 @@ def main():
         entry_points=[CallbackQueryHandler(add_novel_start, pattern="^add_novel$")],
         states={
             NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_name)],
-            AUTHOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_author)],
-            PLATFORM: [CallbackQueryHandler(add_platform_callback, pattern="^plat_")],
-            CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_channel)],
-            STORY_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_story_name)],
+            AUTHOR: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_author_text),
+                CallbackQueryHandler(skip_author_btn, pattern="^skip_author$")
+            ],
             IMAGE: [
                 MessageHandler(filters.PHOTO, add_image),
-                CallbackQueryHandler(add_image_skip, pattern="^skip_image$"),
-                CallbackQueryHandler(cancel_add, pattern="^cancel_add$"),
+                CallbackQueryHandler(skip_image_btn, pattern="^skip_image$")
+            ],
+            PLATFORM: [CallbackQueryHandler(add_platform_callback, pattern="^plat_")],
+            CHANNEL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_channel_text),
+                CallbackQueryHandler(skip_channel_btn, pattern="^skip_channel$")
+            ],
+            STORY_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_story_text),
+                CallbackQueryHandler(skip_story_btn, pattern="^skip_story$")
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel_add)],
+        fallbacks=[
+            CommandHandler("cancel", cancel_add),
+            CallbackQueryHandler(cancel_add, pattern="^cancel_add$")
+        ],
     )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(conv_handler)
     app.add_handler(CallbackQueryHandler(help_menu, pattern="^help_menu$"))
+    app.add_handler(CallbackQueryHandler(start_menu_callback, pattern="^start_menu$"))
     app.add_handler(CallbackQueryHandler(search_menu, pattern="^search_menu$"))
     app.add_handler(CallbackQueryHandler(search_page_callback, pattern="^search_page_"))
     app.add_handler(CallbackQueryHandler(button_same_diff, pattern="^(same_|diff_)"))
+    
     app.add_handler(CallbackQueryHandler(admin_panel, pattern="^admin$"))
     app.add_handler(CallbackQueryHandler(admin_list_callback, pattern="^admin_list$"))
     app.add_handler(CallbackQueryHandler(admin_list_page_callback, pattern="^admin_list_page_"))
     app.add_handler(CallbackQueryHandler(admin_filter_callback, pattern="^admin_filter$"))
     app.add_handler(CallbackQueryHandler(admin_stats, pattern="^admin_stats$"))
     app.add_handler(CallbackQueryHandler(admin_delete_prompt, pattern="^admin_delete_prompt$"))
+    
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CommandHandler("index", index_cmd))
     app.add_handler(CommandHandler("stopindex", stop_index))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("promote", promote_cmd))
     app.add_handler(CommandHandler("demote", demote_cmd))
+    app.add_handler(CommandHandler("export", export_cmd))
+    
     app.add_handler(MessageHandler(filters.PHOTO & filters.Chat(GROUP_CHAT_ID), handle_group_photo))
-    app.add_handler(MessageHandler(filters.FORWARDED & filters.ChatType.PRIVATE, handle_forward))
-    app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE, handle_search_text))
-    app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE, handle_filter_text))
-    app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE, handle_delete_id))
+    app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & filters.ChatType.PRIVATE & ~filters.COMMAND, handle_private_message))
 
     app.run_webhook(
         listen="0.0.0.0",
