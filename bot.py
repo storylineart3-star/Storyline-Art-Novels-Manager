@@ -1715,13 +1715,3 @@ def main():
 if __name__ == "__main__":
     main()
 }
-You got it completely wrong, I shared you the wrong file and you updated the wrong file instead of my php bot. I need you to implement those modifications in my  WP PHP bot that we've been working on, you sent me python code instead of php bot file, I need you to implement those codes in my PHP FILE.
-
-My requirements were - 
-Word counter showing wrong word count ( I need pocket novel word counter or any other text to speech software's word counting method )
-
-Instead of asking to writer yes no or publish now/draft, date time, just add inline buttons wherever needed for better ux and ui, and make sure to ask for time and date seprately when user choses scheduling. Everything else is good for now, also if the command /adminlogin <user_id> need telegram user id to logged in for admin, then it sucks anyone who have admins telegram user id will be able to log in directly to bot, if it doesn't work this way then ignore it. Send full code in two parts with asked modifications.
-Also add a option to skip titles for chapter. Or just ask if user wants to add titles or not, after splitting text file. If no then just publish every chapter according to users chosen visibility.
-
-
-And you implemented these features in python bot instead of php bot file. Read the whole chat first and then send me the php bot file code in two parts.
